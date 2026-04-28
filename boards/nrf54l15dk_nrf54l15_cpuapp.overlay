@@ -1,0 +1,12 @@
+&storage_partition {
+	reg = <0x15c000 DT_SIZE_K(32)>;
+};
+
+&cpuapp_rram {
+	partitions {
+		memfault_coredump_partition: partition@164000 {
+			label = "memfault_coredump_partition";
+			reg = <0x164000 DT_SIZE_K(4)>;
+		};
+	};
+};

@@ -1,0 +1,15 @@
+app:
+  address: 0x0
+  end_address: 0x15c000
+  region: flash_primary
+  size: 0x15c000
+settings_storage:
+  address: 0x15c000
+  end_address: 0x164000
+  region: flash_primary
+  size: 0x8000
+memfault_coredump_partition:
+  address: 0x164000
+  end_address: 0x165000
+  region: flash_primary
+  size: 0x1000

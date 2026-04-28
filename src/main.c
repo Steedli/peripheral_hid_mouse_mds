@@ -361,8 +361,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	struct bt_conn_info info;
 	err = bt_conn_get_info(conn, &info);
 	if (!err) {
-		uint32_t interval_ms = info.le.interval_us / 1000;
-		uint32_t interval_frac = (info.le.interval_us % 1000) / 10;
+		uint32_t interval_us = BT_CONN_INTERVAL_TO_US(info.le.interval);
+		uint32_t interval_ms = interval_us / 1000;
+		uint32_t interval_frac = (interval_us % 1000) / 10;
 		printk("Connection interval: %u.%02u ms\n",
 		       interval_ms, interval_frac);
 		printk("Latency: %u, Timeout: %u ms\n",

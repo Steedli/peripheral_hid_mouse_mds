@@ -28,4 +28,15 @@ config BT_DIRECTED_ADVERTISING
 	default y
 	depends on BT_HIDS_SECURITY_ENABLED
 
+config MEMFAULT_FIXED_PARTITION_COREDUMP
+	bool "Use fixed partition storage for Memfault coredumps"
+	depends on MEMFAULT
+	depends on FLASH
+	depends on FLASH_MAP
+	depends on SOC_FLASH_NRF_RRAM
+	select NRFX_RRAMC
+	select MEMFAULT_COREDUMP_STORAGE_CUSTOM
+	help
+	  Use the memfault_coredump_partition fixed partition for coredump storage.
+
 endmenu
