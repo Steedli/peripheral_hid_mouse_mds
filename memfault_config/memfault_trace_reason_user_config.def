@@ -1,0 +1,3 @@
+/* Application-specific trace reasons for the MDS-enabled HIDS mouse build. */
+
+MEMFAULT_TRACE_REASON_DEFINE(button_state_changed)

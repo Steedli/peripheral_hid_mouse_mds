@@ -25,8 +25,16 @@
 
 #include <zephyr/bluetooth/services/bas.h>
 #include <bluetooth/services/hids.h>
+#if defined(CONFIG_BT_MDS)
+#include <bluetooth/services/mds.h>
+#endif
 #include <zephyr/bluetooth/services/dis.h>
 #include <dk_buttons_and_leds.h>
+
+#if defined(CONFIG_MEMFAULT)
+#include <memfault/core/trace_event.h>
+#include <memfault/metrics/metrics.h>
+#endif
 
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -72,6 +80,9 @@
 #define KEY_PAIRING_ACCEPT DK_BTN1_MSK
 #define KEY_PAIRING_REJECT DK_BTN2_MSK
 
+/* Key used to erase all bonds (long press 5 seconds) */
+#define KEY_BOND_ERASE_MASK DK_BTN1_MSK
+
 /* HIDS instance. */
 BT_HIDS_DEF(hids_obj,
 	    INPUT_REP_BUTTONS_LEN,
@@ -96,6 +107,11 @@ K_MSGQ_DEFINE(bonds_queue,
 	      sizeof(bt_addr_le_t),
 	      CONFIG_BT_MAX_PAIRED,
 	      4);
+
+/* Directed advertising retry tracking */
+static bt_addr_le_t current_dir_adv_addr;
+static uint8_t dir_adv_retry_count;
+#define DIR_ADV_MAX_RETRIES 3
 #endif
 
 static const struct bt_data ad[] = {
@@ -105,6 +121,9 @@ static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL),
 					  BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
+#if defined(CONFIG_BT_MDS)
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_MDS_VAL),
+#endif
 };
 
 static const struct bt_data sd[] = {
@@ -117,10 +136,22 @@ static struct conn_mode {
 } conn_mode[CONFIG_BT_HIDS_MAX_CLIENT_COUNT];
 
 static volatile bool is_adv_running;
+static bool pending_repairing;
+/* Active BT identity used for advertising; always ID 1 (ID 0 cannot be reset) */
+static uint8_t current_adv_id = 1U;
+#if defined(CONFIG_BT_MDS)
+static struct bt_conn *mds_conn;
+#endif
 
 static struct k_work adv_work;
 
 static struct k_work pairing_work;
+static struct k_work_delayable bond_erase_work;
+static struct k_work_delayable post_erase_adv_work;
+
+/* Forward declaration */
+static void identity_refresh(void);
+
 struct pairing_data_mitm {
 	struct bt_conn *conn;
 	unsigned int passkey;
@@ -161,8 +192,26 @@ static void advertising_continue(void)
 
 #if CONFIG_BT_DIRECTED_ADVERTISING
 	bt_addr_le_t addr;
+	bool has_addr = false;
 
-	if (!k_msgq_get(&bonds_queue, &addr, K_NO_WAIT)) {
+	/* Check if we have a retry pending */
+	if (dir_adv_retry_count > 0 && dir_adv_retry_count < DIR_ADV_MAX_RETRIES) {
+		addr = current_dir_adv_addr;
+		has_addr = true;
+		dir_adv_retry_count++;
+		printk("Retrying directed advertising (%u/%u)\n", 
+		       dir_adv_retry_count, DIR_ADV_MAX_RETRIES);
+	} else if (!k_msgq_get(&bonds_queue, &addr, K_NO_WAIT)) {
+		/* New bonded device to try */
+		has_addr = true;
+		current_dir_adv_addr = addr;
+		dir_adv_retry_count = 1;
+	} else if (dir_adv_retry_count >= DIR_ADV_MAX_RETRIES) {
+		/* Max retries reached, reset counter */
+		dir_adv_retry_count = 0;
+	}
+
+	if (has_addr) {
 		char addr_buf[BT_ADDR_LE_STR_LEN];
 		int err;
 
@@ -175,8 +224,11 @@ static void advertising_continue(void)
 			is_adv_running = false;
 		}
 
+		/* Use high duty cycle for all attempts - it has automatic timeout */
 		adv_param = *BT_LE_ADV_CONN_DIR(&addr);
-		adv_param.options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;
+		// adv_param.options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;
+		adv_param.options |= BT_LE_ADV_OPT_USE_IDENTITY;
+		adv_param.id = current_adv_id;
 
 		err = bt_le_adv_start(&adv_param, NULL, 0, NULL, 0);
 
@@ -195,8 +247,15 @@ static void advertising_continue(void)
 		if (is_adv_running) {
 			return;
 		}
-
+		/* Use whitelist/filter policy for scanning requests */
+		/* Only bonded devices in the filter accept list can discover this device */
+		// adv_param = *BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | 
+		// 				    BT_LE_ADV_OPT_FILTER_CONN,
+		// 				    BT_GAP_ADV_FAST_INT_MIN_2,
+		// 				    BT_GAP_ADV_FAST_INT_MAX_2,
+		// 				    NULL);
 		adv_param = *BT_LE_ADV_CONN_FAST_2;
+		adv_param.id = current_adv_id;
 		err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad),
 				  sd, ARRAY_SIZE(sd));
 		if (err) {
@@ -214,7 +273,8 @@ static void advertising_start(void)
 {
 #if CONFIG_BT_DIRECTED_ADVERTISING
 	k_msgq_purge(&bonds_queue);
-	bt_foreach_bond(BT_ID_DEFAULT, bond_find, NULL);
+	bt_foreach_bond(current_adv_id, bond_find, NULL);
+	dir_adv_retry_count = 0; /* Reset retry counter */
 #endif
 
 	k_work_submit(&adv_work);
@@ -298,11 +358,35 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	printk("Connected %s\n", addr);
 
+	struct bt_conn_info info;
+	err = bt_conn_get_info(conn, &info);
+	if (!err) {
+		uint32_t interval_ms = info.le.interval_us / 1000;
+		uint32_t interval_frac = (info.le.interval_us % 1000) / 10;
+		printk("Connection interval: %u.%02u ms\n",
+		       interval_ms, interval_frac);
+		printk("Latency: %u, Timeout: %u ms\n",
+		       info.le.latency,
+		       info.le.timeout * 10);
+	}
+
 	err = bt_hids_connected(&hids_obj, conn);
 
 	if (err) {
 		printk("Failed to notify HID service about connection\n");
 		return;
+	}
+
+	/* Request connection parameter update for low latency */
+	struct bt_le_conn_param param = {
+		.interval_min = 6,   /* 7.5 ms */
+		.interval_max = 6,   /* 7.5 ms */
+		.latency = 0,       /* Can skip 0 events */
+		.timeout = 400,      /* 4000 ms */
+	};
+	err = bt_conn_le_param_update(conn, &param);
+	if (err) {
+		printk("Failed to request conn param update (err %d)\n", err);
 	}
 
 	insert_conn_object(conn);
@@ -335,11 +419,33 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		}
 	}
 
-	advertising_start();
+#if defined(CONFIG_BT_MDS)
+	if (conn == mds_conn) {
+		mds_conn = NULL;
+	}
+#endif
+
+	if (pending_repairing) {
+		/* Bond erase in progress; check if all connections are gone.
+		 * Only safe to call bt_id_reset() once no connections are active.
+		 */
+		bool all_disconnected = true;
+
+		for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++) {
+			if (conn_mode[i].conn) {
+				all_disconnected = false;
+				break;
+			}
+		}
+		if (all_disconnected) {
+			identity_refresh();
+		}
+	} else {
+		advertising_start();
+	}
 }
 
 
-#ifdef CONFIG_BT_HIDS_SECURITY_ENABLED
 static void security_changed(struct bt_conn *conn, bt_security_t level,
 			     enum bt_security_err err)
 {
@@ -349,20 +455,50 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 
 	if (!err) {
 		printk("Security changed: %s level %u\n", addr, level);
+		/* Pairing or re-pairing succeeded; return to normal operation */
+		pending_repairing = false;
+#if defined(CONFIG_BT_MDS)
+		if ((level >= BT_SECURITY_L2) && !mds_conn) {
+			mds_conn = conn;
+		}
+#endif
 	} else {
 		printk("Security failed: %s level %u err %d %s\n", addr, level, err,
 		       bt_security_err_to_str(err));
+
+		if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING) {
+			/* Remote still holds the old LTK; our bond is already gone.
+			 * The user pressed BTN4 to start this advertising session,
+			 * so request fresh SMP pairing on the current connection.
+			 */
+			int ret = bt_conn_set_security(conn,
+						       BT_SECURITY_L2 |
+						       BT_SECURITY_FORCE_PAIR);
+			if (ret) {
+				printk("Re-pairing request failed (err %d)\n", ret);
+			} else {
+				printk("Re-pairing requested for %s\n", addr);
+			}
+		}
 	}
 }
-#endif
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
-#ifdef CONFIG_BT_HIDS_SECURITY_ENABLED
 	.security_changed = security_changed,
-#endif
 };
+
+#if defined(CONFIG_BT_MDS)
+static bool mds_access_enable(struct bt_conn *conn)
+{
+	return mds_conn && (conn == mds_conn);
+}
+
+static const struct bt_mds_cb mds_cb = {
+	.access_enable = mds_access_enable,
+};
+#endif
 
 
 static void hids_pm_evt_handler(enum bt_hids_pm_evt evt,
@@ -651,69 +787,168 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 	       bt_security_err_to_str(reason));
 }
 
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-	.passkey_display = auth_passkey_display,
-	.passkey_confirm = auth_passkey_confirm,
-	.cancel = auth_cancel,
-};
-
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_complete = pairing_complete,
 	.pairing_failed = pairing_failed
 };
 #else
-static struct bt_conn_auth_cb conn_auth_callbacks;
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
 #endif /* defined(CONFIG_BT_HIDS_SECURITY_ENABLED) */
 
-
-static void num_comp_reply(bool accept)
+static void post_erase_adv_handler(struct k_work *work)
 {
-	struct pairing_data_mitm pairing_data;
-	struct bt_conn *conn;
+	pending_repairing = false;
+	printk("Advertising with new identity (ID %u)\n", current_adv_id);
+	advertising_start();
+}
 
-	if (k_msgq_get(&mitm_queue, &pairing_data, K_NO_WAIT) != 0) {
+static void identity_refresh(void)
+{
+	int err;
+	char addr_str[BT_ADDR_LE_STR_LEN];
+
+	/* ID 1 is always used; bt_id_reset() resets its address and IRK.
+	 * The PC holds the old IRK for ID 1 and cannot resolve RPAs from
+	 * the new IRK, so it treats this as a brand-new device.
+	 */
+	err = bt_id_reset(current_adv_id, NULL, NULL);
+	if (err < 0) {
+		printk("bt_id_reset(ID %u) failed (err %d)\n", current_adv_id, err);
 		return;
 	}
 
-	conn = pairing_data.conn;
+	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+	size_t count = CONFIG_BT_ID_MAX;
 
-	if (accept) {
-		bt_conn_auth_passkey_confirm(conn);
-		printk("Numeric Match, conn %p\n", conn);
-	} else {
-		bt_conn_auth_cancel(conn);
-		printk("Numeric Reject, conn %p\n", conn);
+	bt_id_get(addrs, &count);
+	bt_addr_le_to_str(&addrs[current_adv_id], addr_str, sizeof(addr_str));
+	printk("BT identity %u reset OK, new addr: %s\n", current_adv_id, addr_str);
+
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_save();
 	}
 
-	bt_conn_unref(pairing_data.conn);
+	/* Wait 3s so Windows abandons auto-reconnect before we appear */
+	printk("Waiting 3s before advertising...\n");
+	k_work_schedule(&post_erase_adv_work, K_SECONDS(3));
+}
 
-	if (k_msgq_num_used_get(&mitm_queue)) {
-		k_work_submit(&pairing_work);
+
+static void bond_erase_handler(struct k_work *work)
+{
+	bool has_conn = false;
+
+	pending_repairing = true;
+
+	if (is_adv_running) {
+		bt_le_adv_stop();
+		is_adv_running = false;
+	}
+
+	printk("Erasing all bonds\n");
+	bt_unpair(current_adv_id, BT_ADDR_LE_ANY);
+
+	/* identity_refresh() must be called with no active connections */
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++) {
+		if (conn_mode[i].conn) {
+			bt_conn_disconnect(conn_mode[i].conn,
+					   BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			has_conn = true;
+		}
+	}
+
+	if (!has_conn) {
+		identity_refresh();
+	} else {
+		printk("Disconnecting... identity refresh after connection drops\n");
 	}
 }
 
 
+#if defined(CONFIG_MEMFAULT)
+static void memfault_button_handler(uint32_t button_state, uint32_t has_changed)
+{
+	static bool time_measure_start;
+
+	int err;
+	uint32_t buttons = button_state & has_changed;
+
+	if (buttons & DK_BTN1_MSK) {
+		time_measure_start = !time_measure_start;
+
+		if (time_measure_start) {
+			err = MEMFAULT_METRIC_TIMER_START(button_elapsed_time_ms);
+			if (err) {
+				printk("Failed to start memfault metrics timer: %d\n", err);
+			} else {
+				printk("button_elapsed_time_ms timer started\n");
+			}
+		} else {
+			err = MEMFAULT_METRIC_TIMER_STOP(button_elapsed_time_ms);
+			if (err) {
+				printk("Failed to stop memfault metrics: %d\n", err);
+			} else {
+				printk("button_elapsed_time_ms timer stopped\n");
+			}
+
+			/* Trigger collection of heartbeat data. */
+			memfault_metrics_heartbeat_debug_trigger();
+			printk("Memfault heartbeat metrics triggered\n");
+		}
+	}
+
+	if (has_changed & DK_BTN2_MSK) {
+		bool button_state = (buttons & DK_BTN2_MSK) ? 1 : 0;
+
+		MEMFAULT_TRACE_EVENT_WITH_LOG(button_state_changed, "Button state: %u",
+					      button_state);
+
+		printk("button_state_changed event has been tracked, button state: %u\n",
+		       button_state);
+	}
+
+	if (buttons & DK_BTN3_MSK) {
+		err = MEMFAULT_METRIC_ADD(button_press_count, 1);
+		if (err) {
+			printk("Failed to increase button_press_count metric: %d\n", err);
+		} else {
+			printk("button_press_count metric increased\n");
+		}
+	}
+
+	if (buttons & DK_BTN4_MSK) {
+		volatile uint32_t i;
+
+		printk("Division by zero will now be triggered\n");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdiv-by-zero"
+		i = 1 / 0;
+#pragma GCC diagnostic pop
+		ARG_UNUSED(i);
+	}
+}
+#endif
+
+
 void button_changed(uint32_t button_state, uint32_t has_changed)
 {
+#if defined(CONFIG_MEMFAULT)
+	memfault_button_handler(button_state, has_changed);
+#else
 	bool data_to_send = false;
 	struct mouse_pos pos;
 	uint32_t buttons = button_state & has_changed;
 
 	memset(&pos, 0, sizeof(struct mouse_pos));
 
-	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED)) {
-		if (k_msgq_num_used_get(&mitm_queue)) {
-			if (buttons & KEY_PAIRING_ACCEPT) {
-				num_comp_reply(true);
-
-				return;
-			}
-
-			if (buttons & KEY_PAIRING_REJECT) {
-				num_comp_reply(false);
-
-				return;
+	/* Long press bond erase detection: press and hold BTN1 for 5 seconds */
+	if (has_changed & KEY_BOND_ERASE_MASK) {
+		if (button_state & KEY_BOND_ERASE_MASK) {
+			k_work_schedule(&bond_erase_work, K_SECONDS(5));
+			printk("Bond erase armed, hold for 5s to erase\n");
+		} else {
+			if (k_work_cancel_delayable(&bond_erase_work) == 0) {
+				printk("Bond erase cancelled\n");
 			}
 		}
 	}
@@ -751,6 +986,7 @@ void button_changed(uint32_t button_state, uint32_t has_changed)
 			k_work_submit(&hids_work);
 		}
 	}
+#endif
 }
 
 
@@ -775,6 +1011,14 @@ static void bas_notify(void)
 		battery_level = 100U;
 	}
 
+#if defined(CONFIG_MEMFAULT)
+	int err = MEMFAULT_METRIC_SET_UNSIGNED(battery_soc_pct, battery_level);
+
+	if (err) {
+		printk("Failed to set battery_soc_pct metric (err %d)\n", err);
+	}
+#endif
+
 	bt_bas_set_battery_level(battery_level);
 }
 
@@ -782,15 +1026,9 @@ static void bas_notify(void)
 int main(void)
 {
 	int err;
-
 	printk("Starting Bluetooth Peripheral HIDS mouse sample\n");
 
 	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED)) {
-		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-		if (err) {
-			printk("Failed to register authorization callbacks.\n");
-			return 0;
-		}
 
 		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
 		if (err) {
@@ -802,6 +1040,14 @@ int main(void)
 	/* DIS initialized at system boot with SYS_INIT macro. */
 	hid_init();
 
+#if defined(CONFIG_BT_MDS)
+	err = bt_mds_cb_register(&mds_cb);
+	if (err) {
+		printk("Memfault Diagnostic service callback registration failed (err %d)\n", err);
+		return 0;
+	}
+#endif
+
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
@@ -812,12 +1058,35 @@ int main(void)
 
 	k_work_init(&hids_work, mouse_handler);
 	k_work_init(&adv_work, advertising_process);
+	k_work_init_delayable(&bond_erase_work, bond_erase_handler);
+	k_work_init_delayable(&post_erase_adv_work, post_erase_adv_handler);
 	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED)) {
 		k_work_init(&pairing_work, pairing_process);
 	}
 
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
+	}
+
+	/* Ensure ID 1 exists; it is the only identity we advertise with.
+	 * Check via bt_id_get: if count < 2, ID 1 does not exist yet.
+	 */
+	{
+		bt_addr_le_t id_addrs[CONFIG_BT_ID_MAX];
+		size_t id_count = CONFIG_BT_ID_MAX;
+
+		bt_id_get(id_addrs, &id_count);
+		if (id_count < 2) {
+			int id1 = bt_id_create(NULL, NULL);
+
+			if (id1 < 0) {
+				printk("Failed to create BT ID 1 (err %d)\n", id1);
+			} else {
+				printk("BT ID 1 created\n");
+			}
+		} else {
+			printk("BT ID 1 already exists\n");
+		}
 	}
 
 	advertising_start();

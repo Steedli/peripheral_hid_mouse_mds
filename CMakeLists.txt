@@ -12,3 +12,5 @@ FILE(GLOB app_sources src/*.c)
 # NORDIC SDK APP START
 target_sources(app PRIVATE ${app_sources})
 # NORDIC SDK APP END
+
+zephyr_include_directories(memfault_config)
