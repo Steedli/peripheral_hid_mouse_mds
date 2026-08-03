@@ -6,7 +6,7 @@ The base application behaves as a BLE HID mouse. The MDS build adds Memfault dia
 
 ## SDK Version
 
-This example is prepared for nRF Connect SDK v3.2.3.
+This example is prepared for nRF Connect SDK v3.4.0.
 
 The commands below assume the NCS environment is already initialized and `west` is available in the shell.
 
@@ -63,7 +63,7 @@ CONFIG_MEMFAULT_NCS_DEVICE_ID_STATIC=y
 CONFIG_MEMFAULT_NCS_DEVICE_ID="nrf-hids-mouse"
 ```
 
-For multiple boards, use a unique and stable device ID. NCS v3.2.3 also supports `CONFIG_MEMFAULT_NCS_DEVICE_ID_HW_ID=y` to derive the ID from hardware, or `CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME=y` to set it from application code.
+For multiple boards, use a unique and stable device ID. NCS v3.4.0 also supports `CONFIG_MEMFAULT_NCS_DEVICE_ID_HW_ID=y` to derive the ID from hardware, or `CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME=y` to set it from application code.
 
 ## Button Behavior
 

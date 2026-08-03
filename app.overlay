@@ -1,12 +1,35 @@
+/*
+ * Carve a Memfault coredump partition out of the board's storage region.
+ *
+ * The nRF54LM20A cpuapp default layout ends its RRAM at 0x1fd000 (2036 kB) with
+ * storage_partition occupying 0x1f4000-0x1fd000 (36 kB). Shrink storage to 32 kB
+ * and place memfault_coredump_partition immediately after it, so nothing
+ * overlaps slot1_partition (which ends at 0x1f4000).
+ *
+ *   0x1f4000  storage_partition            (32 kB)
+ *   0x1fc000  memfault_coredump_partition  ( 4 kB, one RRAM erase block)
+ */
+
+/ {
+	chosen {
+		nordic,memfault-coredump-partition = &memfault_coredump_partition;
+	};
+};
+
+/delete-node/ &storage_partition;
+
 &cpuapp_rram {
 	partitions {
-		storage_partition: partition@1dd000 {
-			reg = <0x1dd000 DT_SIZE_K(28)>;
+		storage_partition: partition@1f4000 {
+			compatible = "zephyr,mapped-partition";
+			label = "storage";
+			reg = <0x1f4000 DT_SIZE_K(32)>;
 		};
 
-		memfault_coredump_partition: partition@1e4000 {
+		memfault_coredump_partition: partition@1fc000 {
+			compatible = "zephyr,mapped-partition";
 			label = "memfault_coredump_partition";
-			reg = <0x1e4000 DT_SIZE_K(4)>;
+			reg = <0x1fc000 DT_SIZE_K(4)>;
 		};
 	};
 };
