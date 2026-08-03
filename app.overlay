@@ -2,12 +2,17 @@
  * Carve a Memfault coredump partition out of the board's storage region.
  *
  * The nRF54LM20A cpuapp default layout ends its RRAM at 0x1fd000 (2036 kB) with
- * storage_partition occupying 0x1f4000-0x1fd000 (36 kB). Shrink storage to 32 kB
- * and place memfault_coredump_partition immediately after it, so nothing
- * overlaps slot1_partition (which ends at 0x1f4000).
+ * storage_partition occupying 0x1f4000-0x1fd000 (36 kB). Re-split that window so
+ * the coredump partition is large enough to hold a full, untruncated coredump.
+ * Nothing here may start below 0x1f4000 -- that is where slot1_partition ends.
  *
- *   0x1f4000  storage_partition            (32 kB)
- *   0x1fc000  memfault_coredump_partition  ( 4 kB, one RRAM erase block)
+ *   0x1f4000  storage_partition            (20 kB, 5 ZMS sectors)
+ *   0x1f9000  memfault_coredump_partition  (16 kB, 4 RRAM erase blocks)
+ *
+ * `mflt coredump_size` reports 9636 B required for this build, so 16 kB leaves
+ * room for more threads or a larger .data before truncation kicks back in. ZMS
+ * needs at least 2 sectors (zephyr/subsys/kvss/zms/zms.c), and this build only
+ * stores one bond plus two identities, so 20 kB is ample.
  */
 
 / {
@@ -23,13 +28,13 @@
 		storage_partition: partition@1f4000 {
 			compatible = "zephyr,mapped-partition";
 			label = "storage";
-			reg = <0x1f4000 DT_SIZE_K(32)>;
+			reg = <0x1f4000 DT_SIZE_K(20)>;
 		};
 
-		memfault_coredump_partition: partition@1fc000 {
+		memfault_coredump_partition: partition@1f9000 {
 			compatible = "zephyr,mapped-partition";
 			label = "memfault_coredump_partition";
-			reg = <0x1fc000 DT_SIZE_K(4)>;
+			reg = <0x1f9000 DT_SIZE_K(16)>;
 		};
 	};
 };
