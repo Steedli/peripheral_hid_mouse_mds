@@ -4,3 +4,13 @@
 
 # build
 /build*/
+
+# firmware images kept around for Memfault symbol file uploads
+*.elf
+*.hex
+*.bin
+
+# screenshots and other scratch attachments
+*.jpg
+*.jpeg
+*.png
