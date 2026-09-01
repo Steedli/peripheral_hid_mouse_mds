@@ -28,4 +28,31 @@ config BT_DIRECTED_ADVERTISING
 	default y
 	depends on BT_HIDS_SECURITY_ENABLED
 
+# Memfault device ID.
+#
+# MEMFAULT_NCS_DEVICE_ID_HW_ID and MEMFAULT_NCS_DEVICE_ID_RUNTIME belong to a
+# Kconfig choice owned by the Memfault integration, so pick exactly one of them
+# in prj_mds.conf. HW_ID needs no application code. RUNTIME does, and the symbols
+# below supply it: selecting RUNTIME is enough to pull in the hw_id library and
+# compile the setter call in main.c, so switching schemes stays a one-line change.
+
+config APP_MEMFAULT_RUNTIME_DEVICE_ID
+	bool
+	default y
+	depends on MEMFAULT_NCS_DEVICE_ID_RUNTIME
+	select HW_ID_LIBRARY
+	help
+	  Internal helper, not meant to be set directly. Tracks
+	  MEMFAULT_NCS_DEVICE_ID_RUNTIME and pulls in the hw_id library so that
+	  main.c can build a device ID from the hardware ID.
+
+config APP_MEMFAULT_DEVICE_ID_PREFIX
+	string "Prefix for the runtime-generated Memfault device ID"
+	default "mouse"
+	depends on APP_MEMFAULT_RUNTIME_DEVICE_ID
+	help
+	  main.c builds the device ID as "<prefix>-<first 8 hex digits of the
+	  hardware ID>". MDS only leaves 22 characters for the serial, so a prefix
+	  longer than 13 characters is truncated. Keep it short.
+
 endmenu

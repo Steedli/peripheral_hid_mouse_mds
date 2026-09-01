@@ -80,20 +80,20 @@ changes it appears as a brand new device and loses its history.
 set**. Setting two is not a build error -- Kconfig keeps the last assignment and
 silently drops the earlier one, which is easy to miss in a `prj.conf` diff.
 
-| Option | Serial comes from | App code needed | Suitable for a fleet |
-| --- | --- | --- | --- |
-| `MEMFAULT_NCS_DEVICE_ID_STATIC` | `CONFIG_MEMFAULT_NCS_DEVICE_ID` string | No | **No** -- every unit reports the same serial |
-| `MEMFAULT_NCS_DEVICE_ID_HW_ID` | `hw_id` library, read from hardware | No | Yes |
-| `MEMFAULT_NCS_DEVICE_ID_RUNTIME` | `memfault_ncs_device_id_set()` | **Yes** | Yes |
+| Option                           | Serial comes from                      | App code needed | Suitable for a fleet                         |
+| -------------------------------- | -------------------------------------- | --------------- | -------------------------------------------- |
+| `MEMFAULT_NCS_DEVICE_ID_STATIC`  | `CONFIG_MEMFAULT_NCS_DEVICE_ID` string | No              | **No** -- every unit reports the same serial |
+| `MEMFAULT_NCS_DEVICE_ID_HW_ID`   | `hw_id` library, read from hardware    | No              | Yes                                          |
+| `MEMFAULT_NCS_DEVICE_ID_RUNTIME` | `memfault_ncs_device_id_set()`         | **Yes**         | Yes                                          |
 
 `STATIC` is only for a single bench board. The two options below are the two ways
 to deploy a fleet.
 
 ### Option 1: HW_ID -- hardware-derived, no application code
 
-This is what the sample uses. `hw_id` reads an identifier out of the silicon
-during `SYS_INIT()`, so the serial exists before `main()` and no application code
-is involved:
+This is the sample's default, selected as block (a) in `prj_mds.conf`. `hw_id`
+reads an identifier out of the silicon during `SYS_INIT()`, so the serial exists
+before `main()` and no application code is involved:
 
 ```conf
 CONFIG_MEMFAULT_NCS_DEVICE_ID_HW_ID=y
@@ -105,13 +105,13 @@ On an nRF54LM20 DK this yields a 16 hex-digit serial such as `6F1C10AF57328697`.
 `CONFIG_MEMFAULT_NCS_DEVICE_ID_HW_ID` selects `HW_ID_LIBRARY`, and the source is
 a nested choice that determines the serial length:
 
-| `HW_ID_LIBRARY_SOURCE_*` | Length | Notes |
-| --- | --- | --- |
-| `DEVICE_ID` | 16 | Default, requires `CONFIG_HWINFO=y`. Available on any SoC |
-| `BT_DEVICE_ADDRESS` | 12 | Not ready at `SYS_INIT()` time -- see below |
-| `NET_MAC` | 12 | Requires networking |
-| `IMEI` | 15 | Modem only |
-| `UUID` | 36 | Modem only, and too long for MDS -- see the URI budget below |
+| `HW_ID_LIBRARY_SOURCE_*` | Length | Notes                                                        |
+| ------------------------ | ------ | ------------------------------------------------------------ |
+| `DEVICE_ID`              | 16     | Default, requires `CONFIG_HWINFO=y`. Available on any SoC    |
+| `BT_DEVICE_ADDRESS`      | 12     | Not ready at `SYS_INIT()` time -- see below                  |
+| `NET_MAC`                | 12     | Requires networking                                          |
+| `IMEI`                   | 15     | Modem only                                                   |
+| `UUID`                   | 36     | Modem only, and too long for MDS -- see the URI budget below |
 
 Choose `DEVICE_ID` for a Bluetooth-only product. `BT_DEVICE_ADDRESS` works, but
 the Bluetooth address is not available when `device_info_init()` runs, so the
@@ -129,28 +129,50 @@ Use this when the serial must come from somewhere the SDK cannot reach on its
 own: a provisioned value in settings, a factory-programmed record, a serial
 number printed on the enclosure, or a readable prefix such as `mouse-6F1C10AF`.
 
+**The sample implements this path**, so switching schemes is a one-line change:
+comment out block (a) in `prj_mds.conf` and uncomment block (b).
+
 ```conf
 CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME=y
-CONFIG_MEMFAULT_NCS_DEVICE_ID_MAX_LEN=30
-# hw_id is still available if you want to build the ID out of the hardware ID
-CONFIG_HW_ID_LIBRARY=y
 CONFIG_HW_ID_LIBRARY_SOURCE_DEVICE_ID=y
 ```
 
-The application must then set it, early in `main()` and before `bt_enable()`:
+Selecting `RUNTIME` is sufficient -- the application `Kconfig` reacts to it:
+
+| Symbol                           | Effect                                                                                                                                                                                            |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APP_MEMFAULT_RUNTIME_DEVICE_ID` | Hidden helper that follows `MEMFAULT_NCS_DEVICE_ID_RUNTIME`. Selects `HW_ID_LIBRARY`, which `HW_ID` would otherwise have selected for you, and compiles `memfault_device_id_init()` into `main.c` |
+| `APP_MEMFAULT_DEVICE_ID_PREFIX`  | Prefix for the generated ID, default `"mouse"`                                                                                                                                                    |
+
+The result is `<prefix>-<first 8 hex digits of the hardware ID>`, for example
+`mouse-B7261A5F`. The implementation is `memfault_device_id_init()` in
+`src/main.c`, called at the top of `main()`:
 
 ```c
-#include <memfault/nrfconnect_port/device_id.h>
+#include <memfault_ncs.h>
 #include <hw_id.h>
 
 char hw_id_buf[HW_ID_LEN];
-char dev_id[24];
+char device_id[23];
 
 if (hw_id_get(hw_id_buf, sizeof(hw_id_buf)) == 0) {
-	snprintk(dev_id, sizeof(dev_id), "mouse-%.8s", hw_id_buf);
-	memfault_ncs_device_id_set(dev_id, strlen(dev_id));
+	snprintk(device_id, sizeof(device_id), "%s-%.8s",
+		 CONFIG_APP_MEMFAULT_DEVICE_ID_PREFIX, hw_id_buf);
+	memfault_ncs_device_id_set(device_id, strlen(device_id));
 }
 ```
+
+The setter is declared in `nrf/include/memfault_ncs.h`, so the include is
+`<memfault_ncs.h>`.
+
+To source the ID from somewhere other than the hardware ID -- settings, a factory
+record, an enclosure serial number -- replace the body of that function. The only
+requirement is that `memfault_ncs_device_id_set()` runs before anything reports
+Memfault data.
+
+Under `HW_ID` none of this is built: the function and its includes are guarded by
+`#if defined(CONFIG_APP_MEMFAULT_RUNTIME_DEVICE_ID)`. Enabling `RUNTIME` costs
+roughly 240 bytes of flash.
 
 Four things to watch out for with `RUNTIME`:
 
@@ -176,11 +198,11 @@ Four things to watch out for with `RUNTIME`:
 MDS builds the chunk upload URI by appending the device serial to a fixed base,
 so the serial length is bounded on this transport:
 
-| Item | Length |
-| --- | --- |
-| `https://chunks.memfault.com/api/v0/chunks/` | 42 |
-| `CONFIG_BT_MDS_MAX_URI_LENGTH` (default) | 64 |
-| **Available for the serial** | **22** |
+| Item                                         | Length |
+| -------------------------------------------- | ------ |
+| `https://chunks.memfault.com/api/v0/chunks/` | 42     |
+| `CONFIG_BT_MDS_MAX_URI_LENGTH` (default)     | 64     |
+| **Available for the serial**                 | **22** |
 
 A 16-character `DEVICE_ID` serial totals 58 and fits. A 36-character `UUID`
 serial totals 78 and trips the `Too long URI` path in
@@ -244,11 +266,11 @@ That file is pulled into the SDK through
 may only contain `MEMFAULT_METRICS_KEY_DEFINE()` entries. The declarations only
 establish the key and its type; the values are written from `src/main.c`.
 
-| Metric | Type | Write macro | Meaning | Driven by |
-| --- | --- | --- | --- | --- |
-| `button_press_count` | `Unsigned` | `MEMFAULT_METRIC_ADD` | Count accumulated over the interval | BTN3 |
-| `button_elapsed_time_ms` | `Timer` | `MEMFAULT_METRIC_TIMER_START` / `_STOP` | Milliseconds accumulated over the interval | BTN1 |
-| `battery_soc_pct` | `Unsigned` | `MEMFAULT_METRIC_SET_UNSIGNED` | Instantaneous value (gauge) | BAS notification |
+| Metric                   | Type       | Write macro                             | Meaning                                    | Driven by        |
+| ------------------------ | ---------- | --------------------------------------- | ------------------------------------------ | ---------------- |
+| `button_press_count`     | `Unsigned` | `MEMFAULT_METRIC_ADD`                   | Count accumulated over the interval        | BTN3             |
+| `button_elapsed_time_ms` | `Timer`    | `MEMFAULT_METRIC_TIMER_START` / `_STOP` | Milliseconds accumulated over the interval | BTN1             |
+| `battery_soc_pct`        | `Unsigned` | `MEMFAULT_METRIC_SET_UNSIGNED`          | Instantaneous value (gauge)                | BAS notification |
 
 ### `button_press_count`
 

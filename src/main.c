@@ -36,6 +36,11 @@
 #include <memfault/metrics/metrics.h>
 #endif
 
+#if defined(CONFIG_APP_MEMFAULT_RUNTIME_DEVICE_ID)
+#include <memfault_ncs.h>
+#include <hw_id.h>
+#endif
+
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
@@ -1023,10 +1028,57 @@ static void bas_notify(void)
 }
 
 
+#if defined(CONFIG_APP_MEMFAULT_RUNTIME_DEVICE_ID)
+/* Build the Memfault device ID from the hardware ID.
+ *
+ * Only compiled when CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME is the selected
+ * scheme. Under CONFIG_MEMFAULT_NCS_DEVICE_ID_HW_ID the Memfault integration
+ * reads the hardware ID itself during SYS_INIT() and none of this is needed.
+ *
+ * This has to run before anything reports Memfault data: until the setter is
+ * called the device serial is an empty string, which leaves the MDS Data URI
+ * without a device ID and makes the gateway app report "NETWORK UNAVAILABLE".
+ * Note that SYS_INIT() already ran by this point, so data captured during boot
+ * (the reboot reason, for instance) still carries the empty serial.
+ */
+static void memfault_device_id_init(void)
+{
+	/* MDS leaves 22 characters for the serial: the chunks endpoint consumes 42
+	 * of the 64 bytes in CONFIG_BT_MDS_MAX_URI_LENGTH.
+	 */
+	char device_id[23];
+	char hw_id_buf[HW_ID_LEN];
+	int err;
+
+	err = hw_id_get(hw_id_buf, sizeof(hw_id_buf));
+	if (err) {
+		printk("Failed to read hardware ID (err %d), Memfault device ID left empty\n",
+		       err);
+		return;
+	}
+
+	(void)snprintk(device_id, sizeof(device_id), "%s-%.8s",
+		       CONFIG_APP_MEMFAULT_DEVICE_ID_PREFIX, hw_id_buf);
+
+	err = memfault_ncs_device_id_set(device_id, strlen(device_id));
+	if (err) {
+		printk("Failed to set Memfault device ID (err %d)\n", err);
+		return;
+	}
+
+	printk("Memfault device ID: %s\n", device_id);
+}
+#endif /* CONFIG_APP_MEMFAULT_RUNTIME_DEVICE_ID */
+
+
 int main(void)
 {
 	int err;
 	printk("Starting Bluetooth Peripheral HIDS mouse sample\n");
+
+#if defined(CONFIG_APP_MEMFAULT_RUNTIME_DEVICE_ID)
+	memfault_device_id_init();
+#endif
 
 	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED)) {
 
